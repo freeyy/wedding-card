@@ -111,11 +111,16 @@ const zOf = (n) => manifest.layers.find((l) => l.name === n)?.z ?? -1;
 const wOf = (n) => (manifest.layers.find((l) => l.name === n)?.vellum ? 0.3 : 0.93);
 const zA = new THREE.Vector4(), zB = new THREE.Vector4(-1, -1, -1, -1);
 const wA = new THREE.Vector4(), wB = new THREE.Vector4(0, 0, 0, 0);
+const swA = new THREE.Vector4(), swB = new THREE.Vector4();   // leaf sway of each caster, so its shadow moves too
+const swayOf = (n) => (REDUCED ? 0 : manifest.layers.find((l) => l.name === n)?.sway ?? 0);
 order.forEach((n, i) => {
-  if (i < 4) { zA.setComponent(i, zOf(n)); wA.setComponent(i, wOf(n)); }
-  else { zB.setComponent(i - 4, zOf(n)); wB.setComponent(i - 4, wOf(n)); }
+  if (i < 4) { zA.setComponent(i, zOf(n)); wA.setComponent(i, wOf(n)); swA.setComponent(i, swayOf(n)); }
+  else { zB.setComponent(i - 4, zOf(n)); wB.setComponent(i - 4, wOf(n)); swB.setComponent(i - 4, swayOf(n)); }
 });
-Object.assign(U, { uZA: { value: zA }, uZB: { value: zB }, uWA: { value: wA }, uWB: { value: wB } });
+Object.assign(U, {
+  uZA: { value: zA }, uZB: { value: zB }, uWA: { value: wA }, uWB: { value: wB },
+  uSwayA: { value: swA }, uSwayB: { value: swB },
+});
 
 // ---------------------------------------------------------------------------
 // GLSL
@@ -141,6 +146,20 @@ float rectSoft(vec2 p, vec2 halfSize, float soft) {
   return 1.0 - smoothstep(-soft, soft, dist);
 }
 vec2 rot2(vec2 p, float a) { float s = sin(a), c = cos(a); return vec2(c * p.x - s * p.y, s * p.x + c * p.y); }
+// The painted leaves stir: barely where the boughs come in (the card's top and
+// left edges) and in the dense middle of the foliage, most at the thin dangling
+// ends. c: position on the card (mm, y down); dens: how much foliage is around
+// it (0..1); amp: sway at the tips (mm). Returns the leaves' displacement in mm.
+vec2 swayAt(vec2 c, float dens, float amp) {
+  float wa = smoothstep(4.0, 45.0, min(c.y, c.x * 1.4));
+  float tip = clamp(1.0 - dens * 1.3, 0.0, 1.0);
+  float a = amp * wa * (0.2 + 0.8 * tip);
+  float t = uTime;
+  float ph = dot(c, vec2(0.05, 0.032));            // a breath of wind crossing the canopy
+  float sx = 0.55 * sin(t * 1.25 - ph * 3.0) + 0.3 * sin(t * 2.2 - ph * 5.3 + 1.7) + 0.35 * sin(t * 0.5 - ph);
+  float sy = 0.3 * sin(t * 1.6 - ph * 4.0 + 0.8) + 0.2 * sin(t * 0.75 - ph * 2.0);
+  return vec2(sx, sy) * a;
+}
 // sunlight that gets through the window and the leaves of the tree outside
 float sunVis(vec3 P) {
   vec2 q = P.xy - uSunDir.xy / max(uSunDir.z, 0.05) * P.z;   // where the ray meets the desk
@@ -285,6 +304,9 @@ uniform mat3 uCardInvRot;
 uniform sampler2D uShA;
 uniform sampler2D uShB;
 uniform vec4 uZA, uZB, uWA, uWB;
+uniform vec4 uSwayA, uSwayB;
+uniform float uSway;
+uniform vec4 uBox;
 uniform sampler2D uAOTex;
 uniform vec4 uAOSel;
 varying vec2 vUv;
@@ -293,7 +315,8 @@ varying vec3 vWorld;
 
 vec2 atlasUv(vec2 cardPos) { return vec2(cardPos.x / uCard.x, 1.0 - cardPos.y / uCard.y); }
 
-// soft shadow cast by a higher sheet onto this one (parallel planes)
+// soft shadow cast by a higher sheet onto this one (parallel planes); a swaying
+// sheet's shadow is looked up where its leaves have moved to
 float shade1(float a, float w) { return 1.0 - a * w; }
 float upperShadow(vec2 k) {
   float vis = 1.0;
@@ -301,12 +324,14 @@ float upperShadow(vec2 k) {
     float dz = uZA[i] - uZ;
     if (dz > 0.05 && uWA[i] > 0.0) {
       vec2 p = vCard + vec2(k.x, -k.y) * dz;
+      if (uSwayA[i] > 0.0) p -= swayAt(p, textureLod(uShA, atlasUv(p), 5.5)[i], uSwayA[i]);
       float pen = 0.16 + dz * 0.032;
       vis *= shade1(textureLod(uShA, atlasUv(p), log2(max(pen / 0.134, 1.0)))[i], uWA[i]);
     }
     dz = uZB[i] - uZ;
     if (dz > 0.05 && uWB[i] > 0.0) {
       vec2 p = vCard + vec2(k.x, -k.y) * dz;
+      if (uSwayB[i] > 0.0) p -= swayAt(p, textureLod(uShB, atlasUv(p), 5.5)[i], uSwayB[i]);
       float pen = 0.16 + dz * 0.032;
       vis *= shade1(textureLod(uShB, atlasUv(p), log2(max(pen / 0.134, 1.0)))[i], uWB[i]);
     }
@@ -319,7 +344,15 @@ float upperAO() {
 }
 
 void main() {
-  vec4 alb = texture(uAlbedo, vUv);
+  vec2 st = vUv;
+  if (uSway > 0.0) {
+    // where the painted leaves have stirred to: read the painting (and its cut) from there
+    vec2 boxMM = uBox.zw - uBox.xy;
+    float dens = textureLod(uAlbedo, vUv, log2(6.0 * float(textureSize(uAlbedo, 0).x) / boxMM.x)).a;
+    vec2 off = swayAt(vCard, dens, uSway);
+    st += vec2(-off.x, off.y) / boxMM;
+  }
+  vec4 alb = texture(uAlbedo, st);
   float cov = alb.a;
   float alpha = cov;
   if (uVellum < 0.5) {
@@ -636,6 +669,7 @@ function sheetMaterial(albedo, opts) {
       uVellum: { value: opts.vellum ? 1 : 0 },
       uBox: { value: new THREE.Vector4(...opts.box) },
       uUvRot: { value: 0 },
+      uSway: { value: opts.sway || 0 },
       uAOTex: aoSlot(opts.name).tex,
       uAOSel: { value: aoSlot(opts.name).sel },
     },
@@ -682,7 +716,7 @@ manifest.layers.forEach((l, i) => {
   const [x0, y0, x1, y1] = l.box_mm;
   const w = x1 - x0, h = y1 - y0;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-    sheetMaterial(blank, { name: l.name, paperOffset: l.paper_offset, z: l.z, box: [x0, y0, x1, y1], vellum: l.vellum, side: THREE.DoubleSide }));
+    sheetMaterial(blank, { name: l.name, paperOffset: l.paper_offset, z: l.z, box: [x0, y0, x1, y1], vellum: l.vellum, sway: REDUCED ? 0 : l.sway, side: THREE.DoubleSide }));
   mesh.position.set((x0 + x1) / 2 - CARD_W / 2, CARD_H / 2 - (y0 + y1) / 2, l.z);
   card.add(mesh);
   layerMesh[i] = mesh;
@@ -1273,6 +1307,7 @@ window.__card = {
   },
   state: S,
   turn: F,
+  layer(name, on) { const i = manifest.layers.findIndex((l) => l.name === name); if (i >= 0) layerMesh[i].visible = on; },
   ready: false,
 };
 

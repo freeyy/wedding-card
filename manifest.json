@@ -24,7 +24,8 @@
     500,
     2100
    ],
-   "vellum": false
+   "vellum": false,
+   "sway": 0.0
   },
   {
    "name": "bush",
@@ -40,7 +41,8 @@
     2207,
     1500
    ],
-   "vellum": false
+   "vellum": false,
+   "sway": 0.0
   },
   {
    "name": "couple",
@@ -56,7 +58,8 @@
     1700,
     33
    ],
-   "vellum": false
+   "vellum": false,
+   "sway": 0.0
   },
   {
    "name": "veil",
@@ -72,7 +75,8 @@
     77,
     1333
    ],
-   "vellum": true
+   "vellum": true,
+   "sway": 0.0
   },
   {
    "name": "tree",
@@ -88,7 +92,8 @@
     1311,
     99
    ],
-   "vellum": false
+   "vellum": false,
+   "sway": 1.0
   },
   {
    "name": "front",
@@ -104,7 +109,26 @@
     911,
     377
    ],
-   "vellum": false
+   "vellum": false,
+   "sway": 1.3
+  },
+  {
+   "name": "canopy",
+   "albedo": "canopy.webp",
+   "z": 5.8,
+   "box_mm": [
+    2.6785714285714284,
+    2.142857142857143,
+    131.19642857142856,
+    132.53571428571428
+   ],
+   "paper_offset": [
+    1311,
+    99
+   ],
+   "vellum": false,
+   "sway": 1.0,
+   "shadow": false
   }
  ],
  "base": {
@@ -145,7 +169,8 @@
    "couple",
    "veil",
    "tree",
-   "front"
+   "front",
+   "canopy"
   ]
  },
  "paper": {
