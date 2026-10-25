@@ -105,21 +105,25 @@ const U = {
   uInvViewProj: { value: new THREE.Matrix4() },
   uRes: { value: new THREE.Vector2(1, 1) },
 };
-// heights / shadow strengths of the sheets packed in the two shadow atlases
+// the sheets packed in the two distance atlases: top height, shadow strength,
+// leaf sway, how far down the solid goes and how it narrows on the way
 const order = manifest.shadow.order;
-const zOf = (n) => manifest.layers.find((l) => l.name === n)?.z ?? -1;
-const wOf = (n) => (manifest.layers.find((l) => l.name === n)?.vellum ? 0.3 : 0.93);
-const zA = new THREE.Vector4(), zB = new THREE.Vector4(-1, -1, -1, -1);
-const wA = new THREE.Vector4(), wB = new THREE.Vector4(0, 0, 0, 0);
-const swA = new THREE.Vector4(), swB = new THREE.Vector4();   // leaf sway of each caster, so its shadow moves too
-const swayOf = (n) => (REDUCED ? 0 : manifest.layers.find((l) => l.name === n)?.sway ?? 0);
-order.forEach((n, i) => {
-  if (i < 4) { zA.setComponent(i, zOf(n)); wA.setComponent(i, wOf(n)); swA.setComponent(i, swayOf(n)); }
-  else { zB.setComponent(i - 4, zOf(n)); wB.setComponent(i - 4, wOf(n)); swB.setComponent(i - 4, swayOf(n)); }
-});
+const layerOf = (n) => manifest.layers.find((l) => l.name === n);
+const pack = (f, empty) => [0, 4].map((o) => new THREE.Vector4(...[0, 1, 2, 3].map((i) => (order[o + i] ? f(layerOf(order[o + i])) : empty))));
+const [zA, zB] = pack((l) => l.z, -1);
+// sheets tucked out of sight cast nothing, so the card's face stays exactly as painted
+const [wA, wB] = pack((l) => (l.hidden ? 0 : l.vellum ? 0.3 : 0.93), 0);
+const [swA, swB] = pack((l) => (REDUCED ? 0 : l.sway || 0), 0);
+const [botA, botB] = pack((l) => l.bottom, 0);
+const [tapA, tapB] = pack((l) => l.taper, 0);
 Object.assign(U, {
   uZA: { value: zA }, uZB: { value: zB }, uWA: { value: wA }, uWB: { value: wB },
   uSwayA: { value: swA }, uSwayB: { value: swB },
+  uBotA: { value: botA }, uBotB: { value: botB }, uTapA: { value: tapA }, uTapB: { value: tapB },
+  uSdf: { value: new THREE.Vector2(manifest.shadow.sdf.lo, manifest.shadow.sdf.range) },
+  uCamLocal: { value: new THREE.Vector3() },
+  uProj: { value: camera.projectionMatrix },
+  uPixAng: { value: 0.001 },
 });
 
 // ---------------------------------------------------------------------------
@@ -268,6 +272,181 @@ vec3 revealMix(vec3 col, vec2 frag) {
 }
 `;
 
+// shadows between the raised sheets, from the distance atlases (D: mm to a
+// sheet's cut line, + inside). Card stock casts from its top; a foliage mass
+// narrows toward the paper and casts from three heights down its column.
+const SHADOW = /* glsl */`
+uniform vec2 uCard;
+uniform sampler2D uShA;
+uniform sampler2D uShB;
+uniform vec4 uZA, uZB, uWA, uWB;
+uniform vec4 uBotA, uBotB, uTapA, uTapB;
+uniform vec4 uSwayA, uSwayB;
+uniform vec2 uSdf;
+vec2 atlasUv(vec2 c) { return vec2(c.x / uCard.x, 1.0 - c.y / uCard.y); }
+float sdfAt(vec2 c, int ch) {
+  vec4 t = ch < 4 ? textureLod(uShA, atlasUv(c), 0.0) : textureLod(uShB, atlasUv(c), 0.0);
+  return t[ch < 4 ? ch : ch - 4] * uSdf.y - uSdf.x;
+}
+// the leaves' sway at c; how much foliage is around (from the distance) sets it
+vec2 sheetSway(vec2 c, int ch, float amp) { return swayAt(c, smoothstep(-2.5, 4.0, sdfAt(c, ch)), amp); }
+float casterOcc(int ch, vec2 c, float zr, vec2 k, float zt, float zb, float tap, float amp) {
+  if (zt - zr < 0.05) return 0.0;
+  float occ = 0.0;
+  float zlo = max(zr, zb);
+  for (int j = 0; j < 3; j++) {
+    if (j > 0 && tap <= 0.0) break;
+    float zj = mix(zt, zlo, float(j) * 0.4);
+    float dz = zj - zr;
+    if (dz <= 0.02) break;
+    vec2 p = c + vec2(k.x, -k.y) * dz;
+    if (amp > 0.0) p -= sheetSway(p, ch, amp) * (zj / zt);
+    float pen = 0.12 + dz * 0.03;
+    occ = max(occ, smoothstep(-pen, pen, sdfAt(p, ch) - tap * (zt - zj)));
+  }
+  return occ;
+}
+// k: the sun's horizontal travel per mm of height, in card space
+float upperShadow(vec2 c, float zr, vec2 k) {
+  float vis = 1.0;
+  for (int i = 0; i < 4; i++) {
+    if (uWA[i] > 0.0) vis *= 1.0 - uWA[i] * casterOcc(i, c, zr, k, uZA[i], uBotA[i], uTapA[i], uSwayA[i]);
+    if (uWB[i] > 0.0) vis *= 1.0 - uWB[i] * casterOcc(i + 4, c, zr, k, uZB[i], uBotB[i], uTapB[i], uSwayB[i]);
+  }
+  return vis;
+}
+`;
+
+// The solid of a raised sheet, ray-marched inside a box around it: the painted
+// top is drawn by the sheet itself (identical to before); this draws what is
+// under it. Card stock is a slab with plain cut edges; foliage is a mass down to
+// the paper, narrowing by uTaper mm per mm so it hides under its own top from
+// the usual view. Its underside carries the same painting, read further into
+// the foliage the deeper it goes, and darker there.
+const VOLUME_VS = /* glsl */`
+uniform vec3 uBoxC;
+varying vec3 vLocal;
+void main() {
+  vLocal = position + uBoxC;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+const VOLUME_FS = /* glsl */`
+${COMMON}
+${REVEAL}
+${SHADOW}
+uniform sampler2D uAlbedo;
+uniform vec4 uBox;
+uniform vec3 uBoxMin, uBoxMax;
+uniform float uTop, uBot, uTaper, uSway, uVellum, uReady, uTexelMM, uCut, uEdgeTint;
+uniform int uChan;
+uniform vec3 uCamLocal;
+uniform mat4 uProj;
+uniform mat4 uCardM;
+uniform float uPixAng;
+uniform mat3 uCardRot;
+uniform mat3 uCardInvRot;
+varying vec3 vLocal;
+
+vec2 toCard(vec2 l) { return vec2(l.x + uCard.x * 0.5, uCard.y * 0.5 - l.y); }
+vec2 layerUv(vec2 c) { return vec2((c.x - uBox.x) / (uBox.z - uBox.x), (uBox.w - c.y) / (uBox.w - uBox.y)); }
+// the solid sits a hair inside the painted cut, so the cut line stays the painting's
+float solidD(vec2 c) { return sdfAt(c, uChan) - 0.06; }
+
+void main() {
+  if (uReady < 0.5) discard;
+  vec3 ro = uCamLocal;
+  vec3 rd = normalize(vLocal - ro);
+  vec3 ta = (uBoxMin - ro) / rd, tb = (uBoxMax - ro) / rd;
+  vec3 tf = max(ta, tb);
+  float tOut = min(min(tf.x, tf.y), tf.z);
+  float t = length(vLocal - ro);
+  vec2 c0 = toCard(vLocal.xy);
+  vec2 sw = uSway > 0.0 ? sheetSway(c0, uChan, uSway) : vec2(0.0);
+  if (vLocal.z > uTop - 1e-3 && texture(uAlbedo, layerUv(c0 - sw)).a >= uCut) discard;
+
+  float tn = inversesqrt(1.0 + uTaper * uTaper);
+  vec3 p = vLocal;
+  vec2 c = c0;
+  bool hit = false;
+  // a ray that passes within a pixel of the solid covers part of that pixel:
+  // shade the closest point with partial coverage, so outlines are smooth
+  float bestR = 1e9, bestT = t;
+  for (int i = 0; i < 56; i++) {
+    p = ro + rd * t;
+    c = toCard(p.xy) - sw * clamp(p.z / uTop, 0.0, 1.0);
+    float e = max(max((uTaper * (uTop - p.z) - solidD(c)) * tn, p.z - uTop), uBot - p.z);
+    if (e < 0.012) { hit = true; break; }
+    float r = e / (t * uPixAng);
+    if (r < bestR) { bestR = r; bestT = t; }
+    t += max(e, 0.008);
+    if (t > tOut) break;
+  }
+  float cover = 1.0;
+  if (!hit) {
+    if (bestR > 0.75) discard;
+    cover = 1.0 - bestR / 0.75;
+    t = bestT;
+    p = ro + rd * t;
+    c = toCard(p.xy) - sw * clamp(p.z / uTop, 0.0, 1.0);
+  }
+
+  float D = solidD(c);
+  float eW = (uTaper * (uTop - p.z) - D) * tn, eT = p.z - uTop, eB = uBot - p.z;
+  float depth = max(uTop - p.z, 0.0);
+  vec3 n;
+  vec3 alb;
+  float aOut = 1.0;
+  if (eB >= eW && eB >= eT) {
+    n = vec3(0.0, 0.0, -1.0);                    // the plain reverse of the sheet
+    alb = uVellum > 0.5 ? vec3(0.93, 0.92, 0.89) : vec3(0.83, 0.78, 0.68);
+    aOut = uVellum > 0.5 ? 0.35 : 1.0;
+  } else {
+    const float h = 0.12;
+    vec2 g = vec2(solidD(c + vec2(h, 0.0)) - solidD(c - vec2(h, 0.0)),
+                  solidD(c + vec2(0.0, h)) - solidD(c - vec2(0.0, h)));
+    vec2 gi = normalize(g + vec2(1e-6, 0.0));    // toward the inside, card space (y down)
+    n = eT > eW ? vec3(0.0, 0.0, 1.0) : normalize(vec3(-gi.x, gi.y, -uTaper));
+    if (uTaper > 0.0) {
+      // the painted foliage, continued into the mass
+      vec2 cs = c + gi * depth * 0.7;
+      float lod = log2(max(t * uPixAng / uTexelMM, 1.0)) + depth * 0.12;
+      alb = textureLod(uAlbedo, layerUv(cs), lod).rgb;
+      alb *= mix(1.0, 0.6, smoothstep(0.0, 1.0, depth / 7.0));
+    } else if (uVellum > 0.5) {
+      alb = vec3(0.95, 0.94, 0.91);
+      aOut = 0.6;
+    } else {
+      // a cut edge: the cotton core, coloured like the painting along it (foliage
+      // sheets are edge-painted, as paper-cut artists do, so leaves get no white rims)
+      float lod = log2(max(t * uPixAng / uTexelMM, 1.0));
+      vec3 painted = textureLod(uAlbedo, layerUv(c), lod).rgb * 0.72;
+      alb = mix(vec3(0.86, 0.82, 0.72), painted, uEdgeTint);
+    }
+  }
+
+  vec3 Pw = (uCardM * vec4(p, 1.0)).xyz;
+  vec3 N = normalize(uCardRot * n);
+  vec3 L = uSunDir;
+  vec3 V = normalize(uCamPos - Pw);
+  vec3 dl = uCardInvRot * L;
+  float vis = sunVis(Pw) * smoothstep(0.0, 0.06, dl.z);
+  if (dl.z > 0.0) vis *= upperShadow(c, p.z, dl.xy / max(dl.z, 0.06));
+  float NoL = max(dot(N, L), 0.0);
+  float wrap = max(dot(N, L) * 0.5 + 0.5, 0.0);
+  float ao = uTaper > 0.0 ? mix(1.0, 0.6, smoothstep(0.0, 1.0, depth / 8.0)) : 1.0;
+  vec3 sky = uSkyCol * (0.58 + 0.42 * N.z) * ao + uBounce * max(-N.z, 0.0);
+  vec3 col = alb * (uSunCol * (NoL * 0.86 + wrap * 0.10) * vis + sky);
+  col += specSun(N, V, L, 0.8, vec3(0.03)) * uSunCol * vis * 0.4;
+  gl_FragColor = vec4(col, aOut * cover);
+  #include <tonemapping_fragment>
+  gl_FragColor.rgb = revealMix(gl_FragColor.rgb, gl_FragCoord.xy);
+  #include <colorspace_fragment>
+  vec4 clip = uProj * viewMatrix * vec4(Pw, 1.0);
+  gl_FragDepth = clip.z / clip.w * 0.5 + 0.5;
+}
+`;
+
 const SHEET_VS = /* glsl */`
 uniform vec4 uBox;          // sheet rectangle on the card, mm (x0, y0, x1, y1), y down
 uniform float uUvRot;       // 1: the painting is turned half round on its sheet
@@ -298,49 +477,22 @@ uniform float uZ;
 uniform float uIsBack;
 uniform float uVellum;
 uniform float uUvRot;
-uniform vec2 uCard;
 uniform mat3 uCardRot;
 uniform mat3 uCardInvRot;
-uniform sampler2D uShA;
-uniform sampler2D uShB;
-uniform vec4 uZA, uZB, uWA, uWB;
-uniform vec4 uSwayA, uSwayB;
 uniform float uSway;
+uniform int uChan;
 uniform vec4 uBox;
 uniform sampler2D uAOTex;
 uniform vec4 uAOSel;
+uniform float uAOAdd;
 varying vec2 vUv;
 varying vec2 vCard;
 varying vec3 vWorld;
+${SHADOW}
 
-vec2 atlasUv(vec2 cardPos) { return vec2(cardPos.x / uCard.x, 1.0 - cardPos.y / uCard.y); }
-
-// soft shadow cast by a higher sheet onto this one (parallel planes); a swaying
-// sheet's shadow is looked up where its leaves have moved to
-float shade1(float a, float w) { return 1.0 - a * w; }
-float upperShadow(vec2 k) {
-  float vis = 1.0;
-  for (int i = 0; i < 4; i++) {
-    float dz = uZA[i] - uZ;
-    if (dz > 0.05 && uWA[i] > 0.0) {
-      vec2 p = vCard + vec2(k.x, -k.y) * dz;
-      if (uSwayA[i] > 0.0) p -= swayAt(p, textureLod(uShA, atlasUv(p), 5.5)[i], uSwayA[i]);
-      float pen = 0.16 + dz * 0.032;
-      vis *= shade1(textureLod(uShA, atlasUv(p), log2(max(pen / 0.134, 1.0)))[i], uWA[i]);
-    }
-    dz = uZB[i] - uZ;
-    if (dz > 0.05 && uWB[i] > 0.0) {
-      vec2 p = vCard + vec2(k.x, -k.y) * dz;
-      if (uSwayB[i] > 0.0) p -= swayAt(p, textureLod(uShB, atlasUv(p), 5.5)[i], uSwayB[i]);
-      float pen = 0.16 + dz * 0.032;
-      vis *= shade1(textureLod(uShB, atlasUv(p), log2(max(pen / 0.134, 1.0)))[i], uWB[i]);
-    }
-  }
-  return vis;
-}
 // sky light partly blocked by the sheets floating above (static, baked)
 float upperAO() {
-  return dot(texture(uAOTex, atlasUv(vCard)), uAOSel);
+  return dot(texture(uAOTex, atlasUv(vCard)), uAOSel) + uAOAdd;
 }
 
 void main() {
@@ -348,8 +500,7 @@ void main() {
   if (uSway > 0.0) {
     // where the painted leaves have stirred to: read the painting (and its cut) from there
     vec2 boxMM = uBox.zw - uBox.xy;
-    float dens = textureLod(uAlbedo, vUv, log2(6.0 * float(textureSize(uAlbedo, 0).x) / boxMM.x)).a;
-    vec2 off = swayAt(vCard, dens, uSway);
+    vec2 off = sheetSway(vCard, uChan, uSway);
     st += vec2(-off.x, off.y) / boxMM;
   }
   vec4 alb = texture(uAlbedo, st);
@@ -391,7 +542,7 @@ void main() {
   float ao = 1.0;
   if (uIsBack < 0.5 && !under) {
     vec2 k = dl.xy / max(dl.z, 0.06);
-    vis *= upperShadow(k);
+    vis *= upperShadow(vCard, uZ, k);
     ao = upperAO();
   }
   float NoL = max(dot(N, L), 0.0);
@@ -652,9 +803,11 @@ const faceMesh = [null, null];
 const layerMesh = [];
 
 function aoSlot(name) {
-  const i = Math.max(0, manifest.ao.order.indexOf(name ?? 'base'));
-  const sel = new THREE.Vector4(); sel.setComponent(i % 4, 1);
-  return { tex: i < 4 ? U.uAOA : U.uAOB, sel };
+  const i = manifest.ao.order.indexOf(name ?? 'base');
+  const sel = new THREE.Vector4();
+  if (i < 0) return { tex: U.uAOA, sel, add: 0.72 };     // deep under the canopy: a fixed shade
+  sel.setComponent(i % 4, 1);
+  return { tex: i < 4 ? U.uAOA : U.uAOB, sel, add: 0 };
 }
 function sheetMaterial(albedo, opts) {
   const m = new THREE.ShaderMaterial({
@@ -670,8 +823,10 @@ function sheetMaterial(albedo, opts) {
       uBox: { value: new THREE.Vector4(...opts.box) },
       uUvRot: { value: 0 },
       uSway: { value: opts.sway || 0 },
+      uChan: { value: order.indexOf(opts.name) },
       uAOTex: aoSlot(opts.name).tex,
       uAOSel: { value: aoSlot(opts.name).sel },
+      uAOAdd: { value: aoSlot(opts.name).add },
     },
     vertexShader: SHEET_VS,
     fragmentShader: SHEET_FS,
@@ -712,15 +867,60 @@ function sheetMaterial(albedo, opts) {
   card.add(slab);
 }
 // raised, hand-cut sheets
+const FOLIAGE = new Set(['tree', 'front', 'bush']);
+const volMesh = [];
+const atlasIn = { a: false, b: false };
+const albedoIn = [];
+function volumesReady() {
+  manifest.layers.forEach((l, i) => { volMesh[i].material.uniforms.uReady.value = albedoIn[i] && atlasIn.a && atlasIn.b ? 1 : 0; });
+}
 manifest.layers.forEach((l, i) => {
   const [x0, y0, x1, y1] = l.box_mm;
   const w = x1 - x0, h = y1 - y0;
+  const sway = REDUCED ? 0 : l.sway;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-    sheetMaterial(blank, { name: l.name, paperOffset: l.paper_offset, z: l.z, box: [x0, y0, x1, y1], vellum: l.vellum, sway: REDUCED ? 0 : l.sway, side: THREE.DoubleSide }));
+    sheetMaterial(blank, { name: l.name, paperOffset: l.paper_offset, z: l.z, box: [x0, y0, x1, y1], vellum: l.vellum, sway }));
   mesh.position.set((x0 + x1) / 2 - CARD_W / 2, CARD_H / 2 - (y0 + y1) / 2, l.z);
   card.add(mesh);
   layerMesh[i] = mesh;
-  if (!l.vellum) sheets.push([mesh, l.z]); else mesh.renderOrder = 50;
+  // the sheet's solid below its painted top (a margin lets swaying leaves stay inside)
+  const m = 1.6;
+  const bmin = new THREE.Vector3(x0 - CARD_W / 2 - m, CARD_H / 2 - y1 - m, l.bottom);
+  const bmax = new THREE.Vector3(x1 - CARD_W / 2 + m, CARD_H / 2 - y0 + m, l.z);
+  const bc = bmin.clone().add(bmax).multiplyScalar(0.5);
+  const size = bmax.clone().sub(bmin);
+  const vol = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), new THREE.ShaderMaterial({
+    uniforms: {
+      ...U,
+      uAlbedo: { value: blank },
+      uBox: { value: new THREE.Vector4(x0, y0, x1, y1) },
+      uBoxMin: { value: bmin }, uBoxMax: { value: bmax }, uBoxC: { value: bc },
+      uTop: { value: l.z }, uBot: { value: l.bottom }, uTaper: { value: l.taper }, uSway: { value: sway },
+      uVellum: { value: l.vellum ? 1 : 0 }, uReady: { value: 0 }, uTexelMM: { value: 0.05 },
+      uCut: { value: l.vellum ? 0.04 : 0.5 },   // where the sheet itself is drawn
+      uEdgeTint: { value: FOLIAGE.has(l.name) || l.hidden ? 0.9 : 0.35 },
+      uChan: { value: order.indexOf(l.name) },
+      uCardM: { value: card.matrixWorld },
+    },
+    vertexShader: VOLUME_VS,
+    fragmentShader: VOLUME_FS,
+    transparent: !!l.vellum,
+    depthWrite: !l.vellum,
+    alphaToCoverage: !l.vellum,
+  }));
+  if (!l.vellum) {
+    // coverage only: keep the alpha out of the canvas (as for the sheets)
+    Object.assign(vol.material, {
+      blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+      blendSrc: THREE.OneFactor, blendDst: THREE.ZeroFactor,
+      blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
+    });
+  }
+  vol.position.copy(bc);
+  card.add(vol);
+  volMesh[i] = vol;
+  if (!l.vellum) { sheets.push([mesh, l.z]); sheets.push([vol, l.z - 0.001]); }
+  else { mesh.renderOrder = 50; vol.renderOrder = 51; }
 });
 
 // dust in the sunbeam
@@ -774,8 +974,8 @@ const DUST = LOWRES ? 70 : 140;
 
 tex('gobo.png', { repeat: true }, (t) => { U.uGobo.value = t; stream.gobo = true; });
 tex(manifest.paper.tex, { repeat: true }, (t) => { U.uPaper.value = t; });
-tex(manifest.shadow.a, {}, (t) => { U.uShA.value = t; });
-tex(manifest.shadow.b, {}, (t) => { U.uShB.value = t; });
+tex(manifest.shadow.a, {}, (t) => { U.uShA.value = t; atlasIn.a = true; volumesReady(); });
+tex(manifest.shadow.b, {}, (t) => { U.uShB.value = t; atlasIn.b = true; volumesReady(); });
 tex(manifest.ao.a, {}, (t) => { U.uAOA.value = t; });
 tex(manifest.ao.b, {}, (t) => { U.uAOB.value = t; });
 tex(manifest.base.albedo, { srgb: true }, (t) => { faceMesh[0].material.uniforms.uAlbedo.value = t; });
@@ -785,7 +985,14 @@ tex(manifest.back.aux, {}, (t) => { faceMesh[1].material.uniforms.uAux.value = t
 tex(`${WOOD}_diff_2k.jpg`, { srgb: true, repeat: true }, (t) => { desk.material.uniforms.uWoodD.value = t; });
 tex(`${WOOD}_nor_gl_2k.jpg`, { repeat: true }, (t) => { desk.material.uniforms.uWoodN.value = t; });
 tex(`${WOOD}_rough_2k.jpg`, { repeat: true }, (t) => { desk.material.uniforms.uWoodR.value = t; });
-manifest.layers.forEach((l, i) => tex(l.albedo, { srgb: true }, (t) => { layerMesh[i].material.uniforms.uAlbedo.value = t; }));
+manifest.layers.forEach((l, i) => tex(l.albedo, { srgb: true }, (t) => {
+  layerMesh[i].material.uniforms.uAlbedo.value = t;
+  const vu = volMesh[i].material.uniforms;
+  vu.uAlbedo.value = t;
+  vu.uTexelMM.value = (l.box_mm[2] - l.box_mm[0]) / t.image.width;
+  albedoIn[i] = true;
+  volumesReady();
+}));
 
 // ---------------------------------------------------------------------------
 // interaction state
@@ -1131,6 +1338,7 @@ function resize() {
   const visH = visW / camera.aspect;
   camDistBase = (visH / 2) / Math.tan(vfov / 2) + TOP;
   camera.updateProjectionMatrix();
+  U.uPixAng.value = (2 * Math.tan(vfov / 2)) / (h * renderer.getPixelRatio());   // one pixel, in radians
   renderer.getDrawingBufferSize(U.uRes.value);
   U.uDustScale.value = renderer.getPixelRatio() * (h / 900);
 }
@@ -1165,6 +1373,8 @@ function orderSheets(faceUp) {
 // opening timeline: shadows fade onto the paper as soon as the leaf texture is
 // in; the colour bloom starts once every painting is on the GPU (and the
 // shadows have had a moment)
+let frozenT = null;   // tests: hold the wind and the light still
+let hiddenSeen = null, hiddenForced = null;
 const intro = { shadeT0: -1, t0: -1, dur: REDUCED ? 1.4 : 4.4, shadeDur: REDUCED ? 0.6 : 1.8, minShade: REDUCED ? 0.6 : 2.2 };
 const smooth = (x) => x * x * (3 - 2 * x);
 
@@ -1172,7 +1382,7 @@ function frame() {
   const rawDt = clock.getDelta();
   const dt = Math.min(rawDt, 0.05);
   const t = clock.elapsedTime;
-  U.uTime.value = REDUCED ? t * 0.3 : t;
+  U.uTime.value = frozenT ?? (REDUCED ? t * 0.3 : t);
   const now = performance.now();
 
   // opening: one texture to the GPU per frame, shadows onto the paper, then the bloom
@@ -1279,6 +1489,14 @@ function frame() {
   camera.lookAt(camTarget);
   camera.updateMatrixWorld();
   U.uInvViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+  U.uCamLocal.value.copy(camera.position).applyMatrix4(U.uCardInv.value);
+  // the leaves tucked under the canopy can only show once the card is turned
+  // well over (they hide up to ~32 degrees); skip drawing them until ~14
+  const seen = hiddenForced ?? U.uCamLocal.value.z < U.uCamLocal.value.length() * 0.97;
+  if (seen !== hiddenSeen) {
+    hiddenSeen = seen;
+    manifest.layers.forEach((l, i) => { if (l.hidden) layerMesh[i].visible = volMesh[i].visible = seen; });
+  }
 
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
@@ -1308,6 +1526,14 @@ window.__card = {
   state: S,
   turn: F,
   layer(name, on) { const i = manifest.layers.findIndex((l) => l.name === name); if (i >= 0) layerMesh[i].visible = on; },
+  freeze(v) { frozenT = v; },
+  solids(on) { volMesh.forEach((m) => { m.visible = on; }); },
+  hidden(on) { hiddenForced = on; hiddenSeen = null; },
+  hold(deg, wx = -1, wy = 0) {
+    // keep the card turned part-way (tests): as if a finger held it there
+    F.wx = wx; F.wy = wy; F.theta = (deg * Math.PI) / 180; F.phase = 'drag'; S.flipping = true;
+    if (S.face === 0) qStart.identity();
+  },
   ready: false,
 };
 
