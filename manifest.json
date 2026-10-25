@@ -1,0 +1,158 @@
+{
+ "card": {
+  "w": 180.0,
+  "h": 135.0,
+  "thickness": 0.65,
+  "px_per_mm": 18.666666666666668,
+  "canvas": [
+   3360,
+   2520
+  ]
+ },
+ "layers": [
+  {
+   "name": "arch",
+   "albedo": "arch.webp",
+   "z": 2.5,
+   "box_mm": [
+    25.285714285714285,
+    22.33928571428571,
+    109.33928571428571,
+    109.44642857142857
+   ],
+   "paper_offset": [
+    500,
+    2100
+   ],
+   "vellum": false
+  },
+  {
+   "name": "bush",
+   "albedo": "bush.webp",
+   "z": 4.5,
+   "box_mm": [
+    10.928571428571427,
+    61.12499999999999,
+    120.05357142857142,
+    121.55357142857142
+   ],
+   "paper_offset": [
+    2207,
+    1500
+   ],
+   "vellum": false
+  },
+  {
+   "name": "couple",
+   "albedo": "couple.webp",
+   "z": 7.0,
+   "box_mm": [
+    43.285714285714285,
+    55.5,
+    119.19642857142857,
+    130.98214285714286
+   ],
+   "paper_offset": [
+    1700,
+    33
+   ],
+   "vellum": false
+  },
+  {
+   "name": "veil",
+   "albedo": "veil.webp",
+   "z": 7.8,
+   "box_mm": [
+    70.17857142857143,
+    63.32142857142857,
+    115.39285714285714,
+    126.53571428571428
+   ],
+   "paper_offset": [
+    77,
+    1333
+   ],
+   "vellum": true
+  },
+  {
+   "name": "tree",
+   "albedo": "tree.webp",
+   "z": 10.0,
+   "box_mm": [
+    3.4285714285714284,
+    2.892857142857143,
+    130.55357142857142,
+    131.78571428571428
+   ],
+   "paper_offset": [
+    1311,
+    99
+   ],
+   "vellum": false
+  },
+  {
+   "name": "front",
+   "albedo": "front.webp",
+   "z": 12.5,
+   "box_mm": [
+    2.6785714285714284,
+    2.142857142857143,
+    131.19642857142856,
+    132.53571428571428
+   ],
+   "paper_offset": [
+    911,
+    377
+   ],
+   "vellum": false
+  }
+ ],
+ "base": {
+  "albedo": "base.webp",
+  "aux": "base_aux.png",
+  "paper_offset": [
+   0,
+   0
+  ]
+ },
+ "back": {
+  "albedo": "back.webp",
+  "aux": "back_aux.png",
+  "paper_offset": [
+   1777,
+   913
+  ]
+ },
+ "shadow": {
+  "a": "shadowA.png",
+  "b": "shadowB.png",
+  "order": [
+   "arch",
+   "bush",
+   "couple",
+   "veil",
+   "tree",
+   "front"
+  ]
+ },
+ "ao": {
+  "a": "aoA.png",
+  "b": "aoB.png",
+  "order": [
+   "base",
+   "arch",
+   "bush",
+   "couple",
+   "veil",
+   "tree",
+   "front"
+  ]
+ },
+ "paper": {
+  "tex": "paper.webp",
+  "tile_px": [
+   3406,
+   1997
+  ]
+ }
+}
