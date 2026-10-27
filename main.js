@@ -1003,7 +1003,8 @@ const S = {
   lift: 0, liftT: 0,
   rx: 0, ry: 0,
   face: 0, flipping: false, settle: 0, settleV: 0,
-  gyro: null, gyroAsked: false,
+  gyro: null,
+  ax: 0, ay: 0,                        // first stage of the tilt smoothing
   mouse: !coarse,
 };
 // zoom: 1 shows the whole card; panning only exists while zoomed in
@@ -1227,7 +1228,6 @@ function endPointer(e) {
   }
   if (!gesture || touches.size > 0) return;
   gesture = null;
-  askMotion();
   // let go: it settles onto whichever side it leans toward
   if (F.phase === 'drag') settleTurn(F.theta > Math.PI / 2);
 }
@@ -1256,32 +1256,23 @@ canvas.addEventListener('keydown', (e) => {
 });
 
 // ---- gyroscope: the phone's tilt leans the card. Readings are used as soon
-// as they arrive; where the browser wants permission (iOS), the first touch asks
-const DOE = window.DeviceOrientationEvent;
-const needsMotionAsk = typeof DOE?.requestPermission === 'function' && navigator.maxTouchPoints > 0;
-let gyroOn = false;
-function startGyro() {
-  if (gyroOn) return;
-  gyroOn = true;
-  addEventListener('deviceorientation', (e) => {
-    if (e.beta == null || e.gamma == null) return;
-    const ang = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
-    let x = e.gamma, y = e.beta;
-    if (ang === 90) { x = e.beta; y = -e.gamma; }
-    else if (ang === -90 || ang === 270) { x = -e.beta; y = e.gamma; }
-    else if (ang === 180) { x = -e.gamma; y = -e.beta; }
-    if (!S.gyro) S.gyro = { x0: x, y0: y };
-    S.gyro.x = x; S.gyro.y = y;
-  });
-}
-if (DOE) startGyro();   // desktops simply never send readings
-// a touch release is the gesture iOS most reliably accepts for the permission dialog
-addEventListener('touchend', () => askMotion(), { passive: true });
-function askMotion() {
-  if (!needsMotionAsk || S.gyroAsked) return;
-  S.gyroAsked = true;
-  DOE.requestPermission().catch(() => {});
-}
+// as they arrive; where the browser wants permission (iOS), the page's own
+// first script asks on the very first tap. The three angles are kept as one
+// whole turn of the screen: the angles alone jump about as the phone stands
+// upright, the turn they make together moves smoothly however it is held
+const D2R = Math.PI / 180;
+const eDev = new THREE.Euler(), qScreenFix = new THREE.Quaternion(), vZ = new THREE.Vector3(0, 0, 1);
+if (window.DeviceOrientationEvent) addEventListener('deviceorientation', (e) => {   // desktops never send readings
+  if (e.beta == null || e.gamma == null) return;
+  const ang = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
+  // the device's turn is Rz(alpha) Rx(beta) Ry(gamma); then into the screen's
+  // own axes, which a landscape screen turns about the device's
+  if (!S.gyro || S.gyro.ang !== ang) S.gyro = { q: new THREE.Quaternion(), q0: null, ang };
+  const G = S.gyro;
+  G.q.setFromEuler(eDev.set(e.beta * D2R, e.gamma * D2R, (e.alpha || 0) * D2R, 'ZXY'))
+    .multiply(qScreenFix.setFromAxisAngle(vZ, -ang * D2R));
+  G.q0 ??= G.q.clone();
+});
 
 // ---- save: a single-file copy of the card that opens anywhere. On claude.ai
 // only members of the owner's organization may download, so the button is
@@ -1351,11 +1342,13 @@ resize();
 const clock = { last: performance.now(), elapsedTime: 0,
   getDelta() { const n = performance.now(); const d = (n - this.last) / 1000; this.last = n; this.elapsedTime += Math.min(d, 0.1); return d; } };
 const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
-const eTmp = new THREE.Euler();
-const qFlip = new THREE.Quaternion(), qLean = new THREE.Quaternion(), qTwist = new THREE.Quaternion();
-const vUp = new THREE.Vector3(), vAxis = new THREE.Vector3(), vTmp = new THREE.Vector3();
+const qFlip = new THREE.Quaternion(), qLean = new THREE.Quaternion(), qTwist = new THREE.Quaternion(), qRel = new THREE.Quaternion();
+const qW = new THREE.Quaternion(), qInv = new THREE.Quaternion(), qTw = new THREE.Quaternion(), qSw = new THREE.Quaternion(), qStep = new THREE.Quaternion();
+const TILT = 8 * D2R;   // phone tilt that leans the card most of the way
+const vUp = new THREE.Vector3(), vAxis = new THREE.Vector3(), vTmp = new THREE.Vector3(), vLean = new THREE.Vector3();
 const corners = [];
 for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-THICK, TOP]) corners.push(new THREE.Vector3(x * CARD_W / 2, y * CARD_H / 2, z));
+const REACH = Math.max(...corners.map((c) => c.length()));   // farthest any corner sits from the pivot
 function lowestZ(q) {
   let m = Infinity;
   for (const c of corners) m = Math.min(m, vTmp.copy(c).applyQuaternion(q).z);
@@ -1407,24 +1400,47 @@ function frame() {
   // input -> target tilt
   let gx = S.tx, gy = S.ty;
   let active = now - S.lastMove < 4000;
-  const gyro = !!(S.gyro && S.gyro.x != null);
+  const gyro = !!(S.gyro && S.gyro.q0);
   if (gyro) {
-    // ~9 degrees of tilt gives the full lean; the neutral pose follows the way
-    // the phone is held only very slowly, so a held tilt keeps showing. The
-    // scene turns against the phone on both axes, so it seems to stay put in
-    // the world while the phone moves around it
-    S.gyro.x0 += (S.gyro.x - S.gyro.x0) * Math.min(1, dt * 0.06);
-    S.gyro.y0 += (S.gyro.y - S.gyro.y0) * Math.min(1, dt * 0.06);
-    gx = THREE.MathUtils.clamp(-(S.gyro.x - S.gyro.x0) / 9, -1, 1);
-    gy = THREE.MathUtils.clamp((S.gyro.y - S.gyro.y0) / 9, -1, 1);
+    // how far the screen has turned since the neutral pose, about its own axes
+    const G = S.gyro;
+    qRel.copy(G.q0).invert().multiply(G.q);
+    if (qRel.w < 0) qRel.set(-qRel.x, -qRel.y, -qRel.z, -qRel.w);
+    const sn = Math.hypot(qRel.x, qRel.y, qRel.z);
+    const turned = 2 * Math.atan2(sn, qRel.w), per = sn > 1e-9 ? turned / sn : 2;
+    // the scene turns against the phone on both axes, so it seems to stay put
+    // in the world while the phone moves around it. ~8 degrees leans most of
+    // the way; past that the lean eases off by its length, not per axis, so
+    // circling the phone circles the card, with no corners
+    const lx = (-qRel.y * per) / TILT, ly = (qRel.x * per) / TILT;
+    const r = Math.hypot(lx, ly), f = r > 1e-6 ? Math.tanh(r) / r : 1;
+    gx = lx * f; gy = ly * f;
+    // the neutral pose follows the way the phone is held, slowly while the
+    // turn is small, so a held tilt keeps showing, and sooner the bigger it
+    // gets. A turn about the vertical (the viewer turning round, the sensor's
+    // slow drift) is followed more readily than a tip against gravity. A
+    // wobble is quicker than either and comes through whole
+    qW.copy(G.q).multiply(qInv.copy(G.q0).invert());          // the turn, in the world
+    const tw = Math.hypot(qW.z, qW.w);
+    if (tw > 1e-6) qTw.set(0, 0, qW.z / tw, qW.w / tw); else qTw.identity();
+    qSw.copy(qW).multiply(qInv.copy(qTw).invert());
+    const tip = 2 * Math.acos(Math.min(1, Math.abs(qSw.w))) / TILT;
+    const yaw = 2 * Math.acos(Math.min(1, Math.abs(qTw.w))) / TILT;
+    qStep.identity().slerp(qSw, Math.min(1, dt * 0.06 * (1 + tip * tip)));
+    qInv.identity().slerp(qTw, Math.min(1, dt * 0.15 * (1 + yaw * yaw)));
+    G.q0.premultiply(qStep.multiply(qInv)).normalize();
     active = true;
   } else if (coarse && !REDUCED && !gesture && now - S.lastMove > 2500) {
     // no gyro: a slow sway so the layers still show their depth
     gx = Math.sin(t * 0.45) * 0.72; gy = Math.sin(t * 0.33 + 1.0) * 0.58;
     active = true;
   }
-  S.px = THREE.MathUtils.damp(S.px, gx, 4.2, dt);
-  S.py = THREE.MathUtils.damp(S.py, gy, 4.2, dt);
+  // two gentle stages rather than one: the lean then never changes speed
+  // abruptly, however the readings arrive
+  S.ax = THREE.MathUtils.damp(S.ax, gx, 8, dt);
+  S.ay = THREE.MathUtils.damp(S.ay, gy, 8, dt);
+  S.px = THREE.MathUtils.damp(S.px, S.ax, 8, dt);
+  S.py = THREE.MathUtils.damp(S.py, S.ay, 8, dt);
   const opening = intro.t0 >= 0 && U.uReveal.value < 1;
   S.liftT = (active || S.flipping || opening) && intro.t0 >= 0 ? 1 : 0;
   S.lift = THREE.MathUtils.damp(S.lift, S.liftT, S.liftT ? 3.0 : 1.6, dt);
@@ -1463,11 +1479,19 @@ function frame() {
   qFlip.setFromAxisAngle(vAxis, F.theta).multiply(qStart);
   qTwist.setFromAxisAngle(AX.z, F.twist * twistK);
   qFlip.premultiply(qTwist);
-  qLean.setFromEuler(eTmp.set(S.rx, S.ry, 0, 'XYZ'));
+  const lean = Math.hypot(S.rx, S.ry);
+  if (lean > 1e-9) qLean.setFromAxisAngle(vLean.set(S.rx / lean, S.ry / lean, 0), lean);
+  else qLean.identity();
   card.quaternion.setFromAxisAngle(AX.z, -0.03).multiply(qLean).multiply(qFlip);
-  // height: the lowest corner of the card (with its stack of sheets) just clears the desk
+  // height: the lowest corner of the card (with its stack of sheets) just
+  // clears the desk. Following whichever corner the lean dips lowest made the
+  // card bob each time another corner took over; instead the lean is allowed
+  // for by how far it could dip any corner, the same in every direction, so
+  // the card floats at one height as it circles
+  const leanCap = maxT * 1.15 * Math.hypot(S.px, S.py);   // >= lean whichever way it points
+  const dip = REACH * (Math.sqrt(leanCap * leanCap + 0.0025) - 0.05);
   const hover = 21 * S.lift + (REDUCED ? 0 : Math.sin(t * 1.1) * 0.7 * S.lift);
-  card.position.set(0, 0, 0.5 - lowestZ(card.quaternion) + hover + 8 * turnS + S.settle);
+  card.position.set(0, 0, 0.5 - lowestZ(qFlip) + dip + hover + 8 * turnS + S.settle);
   card.updateMatrixWorld(true);
   orderSheets(vUp.set(0, 0, 1).applyQuaternion(qFlip).z > 0);
   U.uCardInv.value.copy(card.matrixWorld).invert();
@@ -1527,6 +1551,7 @@ window.__card = {
   },
   state: S,
   turn: F,
+  card,
   layer(name, on) { const i = manifest.layers.findIndex((l) => l.name === name); if (i >= 0) layerMesh[i].visible = on; },
   freeze(v) { frozenT = v; },
   solids(on) { volMesh.forEach((m) => { m.visible = on; }); },
