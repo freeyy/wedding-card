@@ -1410,10 +1410,12 @@ function frame() {
   const gyro = !!(S.gyro && S.gyro.x != null);
   if (gyro) {
     // ~9 degrees of tilt gives the full lean; the neutral pose follows the way
-    // the phone is held only very slowly, so a held tilt keeps showing
+    // the phone is held only very slowly, so a held tilt keeps showing. The
+    // scene turns against the phone on both axes, so it seems to stay put in
+    // the world while the phone moves around it
     S.gyro.x0 += (S.gyro.x - S.gyro.x0) * Math.min(1, dt * 0.06);
     S.gyro.y0 += (S.gyro.y - S.gyro.y0) * Math.min(1, dt * 0.06);
-    gx = THREE.MathUtils.clamp((S.gyro.x - S.gyro.x0) / 9, -1, 1);
+    gx = THREE.MathUtils.clamp(-(S.gyro.x - S.gyro.x0) / 9, -1, 1);
     gy = THREE.MathUtils.clamp((S.gyro.y - S.gyro.y0) / 9, -1, 1);
     active = true;
   } else if (coarse && !REDUCED && !gesture && now - S.lastMove > 2500) {
